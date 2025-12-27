@@ -44,6 +44,7 @@ def load_empty_model(llm_path):
     llava_ov_config = Llavaonevision1_5Config()
     llm_config = AutoConfig.from_pretrained(llm_path, trust_remote_code=True, use_fast=True)
     llava_ov_config.text_config.update(llm_config.to_dict())
+    llava_ov_config.text_config.tie_word_embeddings = False
     llava_ov_config.vision_config.text_hidden_size = llava_ov_config.text_config.hidden_size
     model = LLaVAOneVision1_5_ForConditionalGeneration(llava_ov_config)
     return model, processor, tokenizer
@@ -260,8 +261,8 @@ def validate_vit_consistency(model, vit_path, img_path):
     sample_image = Image.open(BytesIO(response.content)).convert("RGB")
     sample_image = sample_image.resize((560, 560))
     
-    rice_model = MLCDVisionModel.from_pretrained(vit_path, device_map={"": f"cuda:{CUDA_DEVICE}"}, dtype=torch.float32)
-    processor = CLIPImageProcessor.from_pretrained(vit_path, device_map={"": f"cuda:{CUDA_DEVICE}"}, dtype=torch.float32, use_fast=True)
+    rice_model = MLCDVisionModel.from_pretrained(vit_path, device_map={"": f"cuda:{CUDA_DEVICE}"})
+    processor = CLIPImageProcessor.from_pretrained(vit_path, device_map={"": f"cuda:{CUDA_DEVICE}"}, use_fast=True)
     rice_inputs = processor.preprocess(images=sample_image, return_tensors="pt").to(dtype=model.dtype, device=rice_model.device)
         
     rice_model = rice_model.eval()
