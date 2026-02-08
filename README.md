@@ -39,6 +39,10 @@
   </a>
   <!-- Training Cost -->
   <img alt="Training Cost" src="https://img.shields.io/badge/Full%20Train%20Cost-~$16K-success">
+  <!-- Paper Citations -->
+  <a href="https://scholar.google.com/scholar_lookup?arxiv_id=2509.23661">
+    <img alt="Citations" src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.semanticscholar.org%2Fgraph%2Fv1%2Fpaper%2FARXIV%3A2509.23661%3Ffields%3DcitationCount&amp;query=citationCount&amp;label=Citations&amp;color=orange&amp;logo=googlescholar&amp">
+  </a>
   <!-- License -->
   <a href="LICENSE">
     <img alt="License" src="https://img.shields.io/badge/License-Apache--2.0-blue.svg?logo=apache&amp">
