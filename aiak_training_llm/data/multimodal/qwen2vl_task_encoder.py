@@ -163,7 +163,154 @@ class Qwen2VLTaskEncoder(TaskEncoder):
 
         return input_ids, target, attn_mask, imgs, image_grid_thw
 
-    def process_sft_qa(self, messages: list, system: str, raw_video: list, raw_image: list, raw_patch_positions: list):
+    def compute_frame_timestamps(self, images, patch_positions, fps):
+        """Compute timestamps for unique frames from patch positions.
+
+        Args:
+            images: List of images
+            patch_positions: Tensor of shape (n, 3) with (t, h, w) coordinates,
+                             where t is the frame index
+            fps: Frames per second
+
+        Returns:
+            List of float timestamps for each unique frame
+        """
+        if patch_positions is None or len(patch_positions) == 0:
+            return []
+
+        t_values = patch_positions[:, 0]
+        unique_t = torch.unique(t_values)
+        timestamps = [float(t.item() / fps) for t in unique_t]
+
+        return timestamps
+
+    def _prepare_messages_with_timestamp(self, messages: list, timestamp: list):
+        """Insert timestamp into messages according to fps and patch positions.
+
+        Args:
+            messages: List of message dicts with 'content' field
+            timestamp: List of timestamps for each image
+
+        Returns:
+            List of messages with timestamps inserted before <image> tags
+        """
+        new_messages = []
+        for message in messages:
+            content = message['content']
+            image_count = content.count('<image>')
+            if image_count > 0:
+                parts = content.split('<image>')
+                new_parts = []
+                timestamp_idx = 0
+                for i, part in enumerate(parts):
+                    new_parts.append(part)
+                    if i < len(parts) - 1:
+                        if timestamp_idx < len(timestamp):
+                            new_parts.append(f"<{timestamp[timestamp_idx]:.1f} seconds><image>")
+                            timestamp_idx += 1
+                        else:
+                            new_parts.append("<image>")
+                new_content = ''.join(new_parts)
+            else:
+                new_content = content
+            new_messages.append({**message, 'content': new_content})
+        return new_messages
+
+    def _insert_timestamp_tokens(
+        self,
+        input_ids: torch.Tensor,
+        target: torch.Tensor,
+        attn_mask: torch.Tensor,
+        patch_positions: list[torch.Tensor],
+        timestamp_tokens: list[list],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Insert timestamp tokens into input_ids based on patch positions.
+
+        Args:
+            input_ids: Input token IDs [seq_len]
+            target: Target labels [seq_len]
+            attn_mask: Attention mask [seq_len]
+            patch_positions: List of tensors, each with shape [n_patches, 3] where columns are (t, h, w)
+            timestamp_tokens: List of token lists for each timestamp
+
+        Returns:
+            Tuple of (new_input_ids, new_target, new_attn_mask)
+        """
+        if len(timestamp_tokens) == 0 or len(patch_positions) == 0:
+            return input_ids, target, attn_mask
+
+        # Flatten patch positions
+        flat_patch_positions = torch.cat(patch_positions, dim=0)
+        t_values = flat_patch_positions[:, 0]
+
+        # Find positions where t dimension changes
+        t_change_patch_indices = []
+        prev_t = None
+        for i, t in enumerate(t_values):
+            if prev_t is None or t != prev_t:
+                t_change_patch_indices.append(i)
+            prev_t = t
+
+        # Convert patch position indices to image token indices (divide by 4)
+        image_token_indices = [patch_idx // 4 for patch_idx in t_change_patch_indices]
+
+        # Determine image token positions in input_ids
+        vision_start_id, img_pad_id, vision_end_id = self.tokenizer.convert_tokens_to_ids(
+            [VISION_TAGS[0], IMAGE_TOKEN, VISION_TAGS[1]]
+        )
+
+        # Find image token positions
+        image_token_positions = []
+        for pos in range(len(input_ids)):
+            if input_ids[pos] == img_pad_id:
+                image_token_positions.append(pos)
+
+        # Make sure we have enough image tokens
+        if len(image_token_indices) > len(image_token_positions):
+            raise ValueError(
+                f"Number of timestamps ({len(timestamp_tokens)}) exceeds number of image tokens ({len(image_token_positions)})"
+            )
+
+        # Sort in descending order to insert from back to front (to preserve positions)
+        insert_indices = list(zip(image_token_indices, timestamp_tokens))
+        insert_indices.sort(key=lambda x: x[0], reverse=True)
+
+        # Insert timestamp tokens from back to front
+        new_input_ids = input_ids.clone()
+        new_target = target.clone()
+        new_attn_mask = attn_mask.clone()
+
+        for image_token_idx, ts_tokens in insert_indices:
+            if image_token_idx < len(image_token_positions):
+                token_pos = image_token_positions[image_token_idx]
+                ts_tensor = torch.tensor(ts_tokens, dtype=torch.long)
+
+                # Insert timestamp tokens before this image token
+                new_input_ids = torch.cat([
+                    new_input_ids[:token_pos],
+                    ts_tensor,
+                    new_input_ids[token_pos:]
+                ], dim=0)
+
+                # Insert IGNORE_INDEX for labels (timestamp tokens should be ignored)
+                ignore_tensor = torch.full((len(ts_tokens),), IGNORE_INDEX, dtype=new_target.dtype)
+                new_target = torch.cat([
+                    new_target[:token_pos],
+                    ignore_tensor,
+                    new_target[token_pos:]
+                ], dim=0)
+
+                # Insert False for attention mask (timestamp tokens are valid tokens)
+                attn_tensor = torch.zeros((len(ts_tokens),), dtype=new_attn_mask.dtype)
+                new_attn_mask = torch.cat([
+                    new_attn_mask[:token_pos],
+                    attn_tensor,
+                    new_attn_mask[token_pos:]
+                ], dim=0)
+
+        return new_input_ids, new_target, new_attn_mask
+
+    def process_sft_qa(self, messages: list, system: str, raw_video: list, raw_image: list, raw_patch_positions: list, **kwargs):
         """process the data for sft qa"""
         video_grid_thw = None
         pixel_values_videos = []
@@ -172,6 +319,7 @@ class Qwen2VLTaskEncoder(TaskEncoder):
         video = []
         image = []
         patch_positions = []
+        timestamp_tokens = None
 
         if raw_image is not None:
             image = raw_image
@@ -180,6 +328,21 @@ class Qwen2VLTaskEncoder(TaskEncoder):
             for i in raw_patch_positions:
                 if i is not None:
                     patch_positions.append(torch.tensor(i, dtype=torch.int64))
+
+        if kwargs is not None and "fps" in kwargs and len(patch_positions) > 0:
+            fps = kwargs['fps'][0] if isinstance(kwargs['fps'], list) else kwargs['fps']
+            pt_patch_position = torch.concat(patch_positions)
+            timestamp = self.compute_frame_timestamps(patch_positions, pt_patch_position, fps)
+            timestamp = [round(t, 1) for t in timestamp]
+            # If the timestamp is larger than the raw image pair, than means this is for codec data
+            # Handle this later in the model forward because we can't insert it here
+            if len(timestamp) == len(raw_image):
+                messages = self._prepare_messages_with_timestamp(messages, timestamp)
+            else:
+                timestamp_tokens = []
+                for time in timestamp:
+                    time_token = self.processor.tokenizer.encode(f"<{time:.1f} seconds>")
+                    timestamp_tokens.append(time_token)
 
         messages, mm_inputs = self.chat_template.mm_plugin.process_messages(
             messages, image if image is not None else [], video if raw_video is not None else [], self.processor
@@ -232,6 +395,16 @@ class Qwen2VLTaskEncoder(TaskEncoder):
         input_ids = torch.tensor(input_ids)
         target = torch.tensor(target)
         attn_mask = torch.zeros_like(input_ids).bool()
+
+        # Insert timestamp tokens into input_ids and target
+        if timestamp_tokens is not None and len(timestamp_tokens) > 0 and len(patch_positions) > 0:
+            input_ids, target, attn_mask = self._insert_timestamp_tokens(
+                input_ids=input_ids,
+                target=target,
+                attn_mask=attn_mask,
+                patch_positions=patch_positions,
+                timestamp_tokens=timestamp_tokens,
+            )
 
         return (
             input_ids,
@@ -322,6 +495,9 @@ class Qwen2VLTaskEncoder(TaskEncoder):
 
         if self.args.training_phase == constants.TrainingPhase.SFT:
             num_tiles = []
+            kwargs = {}
+            if hasattr(sample, "fps"):
+                kwargs['fps'] = sample.fps
 
             (
                 input_ids,
@@ -332,7 +508,7 @@ class Qwen2VLTaskEncoder(TaskEncoder):
                 pixel_values_videos,
                 video_grid_thw,
                 patch_positions,
-            ) = self.process_sft_qa(sample.messages, sample.system, sample.video, sample.image, sample.patch_positions)
+            ) = self.process_sft_qa(sample.messages, sample.system, sample.video, sample.image, sample.patch_positions, **kwargs)
             if sample.video is not None:
                 num_tiles = [len(video_grid_thw)]
             elif sample.image is not None:
@@ -392,7 +568,7 @@ class Qwen2VLTaskEncoder(TaskEncoder):
             video_grid_thw = None
 
         return image_grid_thw, video_grid_thw
-
+    
     @override
     @stateless
     def pack_selected_samples(self, samples: list[Qwen2VLImageTaskSample]) -> list[Qwen2VLImageTaskSamplePacked]:
