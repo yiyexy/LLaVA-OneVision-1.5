@@ -1,3 +1,28 @@
+# =============================================================================
+# LLaVA-OneVision2 2B – Convert HuggingFace checkpoint to Megatron-Core
+# =============================================================================
+#
+# Usage:
+#   bash convert_2b_hf_to_mcore.sh <LOAD> <SAVE> <TP> <PP> [CUSTOM_PIPELINE_LAYERS]
+#
+# Arguments:
+#   LOAD                    Path to the source HuggingFace checkpoint
+#   SAVE                    Path to save the Megatron-Core checkpoint
+#   TP                      Tensor parallel size
+#   PP                      Pipeline parallel size
+#   CUSTOM_PIPELINE_LAYERS  (optional) Comma-separated layer counts per PP stage.
+#                           Use this when the ViT encoder occupies stage-0 and
+#                           you want an uneven LLM-layer split across stages.
+#
+# Recommended splits for the 2B model (28 LLM layers, 300M ViT on stage-0):
+#   PP=4 : 0,9,9,10    ← stage-0 holds ViT only; stages 1-3 share 28 layers
+#   PP=3 : 0,14,14     ← stage-0 holds ViT only; stages 1-2 each get 14 layers
+#
+# Examples:
+#   bash convert_2b_hf_to_mcore.sh /src /dst 2 4 0,9,9,10
+#   bash convert_2b_hf_to_mcore.sh /src /dst 1 1
+# =============================================================================
+
 AIAK_TRAINING_PATH="${AIAK_TRAINING_PATH:-/workspace/LLaVA-OneVision-2}"
 AIAK_MAGATRON_PATH="${AIAK_MAGATRON_PATH:-${AIAK_TRAINING_PATH%/}/aiak_megatron}"
 CONVERT_CHECKPOINT_PATH="$AIAK_TRAINING_PATH/tools/convert_checkpoint"
@@ -6,7 +31,9 @@ LOAD=$1
 SAVE=$2
 TP=$3
 PP=$4
+CUSTOM_PIPELINE_LAYERS=$5
 
+mkdir -p ./tmp/
 SAVE_LANGUAGE_MODEL=./tmp/language-mcore
 SAVE_VISION_MODEL=./tmp/vision-model-mcore
 SAVE_ADAPTER=./tmp/adapter-mcore
@@ -20,6 +47,7 @@ python $CONVERT_CHECKPOINT_PATH/model.py \
     --common_config_path=$CONVERT_CHECKPOINT_PATH/config/llava-onevision2-2b/qwen3.json \
     --tensor_model_parallel_size=$TP \
     --pipeline_model_parallel_size=$PP \
+    ${CUSTOM_PIPELINE_LAYERS:+--custom_pipeline_layers=$CUSTOM_PIPELINE_LAYERS} \
     --load_ckpt_path=$LOAD \
     --save_ckpt_path=$SAVE_LANGUAGE_MODEL \
     --safetensors \

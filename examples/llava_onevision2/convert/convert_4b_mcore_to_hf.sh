@@ -1,3 +1,27 @@
+# =============================================================================
+# LLaVA-OneVision2 4B – Convert Megatron-Core checkpoint to HuggingFace
+# =============================================================================
+#
+# Usage:
+#   bash convert_4b_mcore_to_hf.sh <LOAD> <SAVE> <TP> <PP> [CUSTOM_PIPELINE_LAYERS]
+#
+# Arguments:
+#   LOAD                    Path to the source Megatron-Core checkpoint
+#   SAVE                    Path to save the HuggingFace checkpoint
+#   TP                      Tensor parallel size
+#   PP                      Pipeline parallel size
+#   CUSTOM_PIPELINE_LAYERS  (optional) Comma-separated layer counts per PP stage,
+#                           must match the layout the checkpoint was saved with.
+#
+# Recommended splits for the 4B model (36 LLM layers, 300M ViT on stage-0):
+#   PP=4 : 0,12,12,12  ← stage-0 holds ViT only; stages 1-3 each get 12 layers
+#   PP=3 : 0,18,18     ← stage-0 holds ViT only; stages 1-2 each get 18 layers
+#
+# Examples:
+#   bash convert_4b_mcore_to_hf.sh /src /dst 2 4 0,12,12,12
+#   bash convert_4b_mcore_to_hf.sh /src /dst 1 1
+# =============================================================================
+
 AIAK_TRAINING_PATH="${AIAK_TRAINING_PATH:-/workspace/LLaVA-OneVision-2}"
 AIAK_MAGATRON_PATH="${AIAK_MAGATRON_PATH:-${AIAK_TRAINING_PATH%/}/aiak_megatron}"
 CONVERT_CHECKPOINT_PATH="$AIAK_TRAINING_PATH/tools/convert_checkpoint"
@@ -6,6 +30,7 @@ LOAD=$1
 SAVE=$2
 TP=$3
 PP=$4
+CUSTOM_PIPELINE_LAYERS=$5
 
 mkdir -p ./tmp/
 SAVE_LANGUAGE_MODEL=./tmp/language-mcore
@@ -22,6 +47,7 @@ python $CONVERT_CHECKPOINT_PATH/model.py \
     --common_config_path=$CONVERT_CHECKPOINT_PATH/config/llava-onevision2-4b/qwen3.json \
     --tensor_model_parallel_size=$TP \
     --pipeline_model_parallel_size=$PP \
+    ${CUSTOM_PIPELINE_LAYERS:+--custom_pipeline_layers=$CUSTOM_PIPELINE_LAYERS} \
     --load_ckpt_path=$LOAD \
     --save_ckpt_path=$SAVE_LANGUAGE_MODEL \
     --safetensors \
