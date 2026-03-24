@@ -58,8 +58,15 @@ def llavaov_2_model_provider(
     # FIXME: fix this if model_type is encoder_and_decoder
     if args.encoder_pipeline_model_parallel_size in [0, None]:
         vision_config.pipeline_model_parallel_size = 1
-        vision_config.tensor_model_parallel_size = 1
-        vision_config.sequence_parallel = False
+        # The vision encoder shares the TP process group with the language model.
+        # Attention head splitting in the encoder uses the actual TP world size
+        # (parallel_state.get_tensor_model_parallel_world_size()), so the TP size
+        # in the config must match the global TP size.  Do NOT override
+        # tensor_model_parallel_size here; it already inherits the correct value
+        # from the base config (build_transformer_config).  Sequence parallel is
+        # likewise inherited: when TP=1 the value has no effect because TE's SP
+        # logic is gated on tp_size > 1.
+        vision_config.first_pipeline_num_layers = vision_config.last_pipeline_num_layers = None
         vision_config.tp_comm_overlap = False
         vision_config.context_parallel_size = 1
         vision_config.context_parallel_ulysses_degree = 1
@@ -76,8 +83,11 @@ def llavaov_2_model_provider(
         # Make sure the vision model does not inherit first and last pipeline num layers from the language model.
         vision_config.first_pipeline_num_layers = vision_config.last_pipeline_num_layers = None
 
-        # TODO: Vision model and projection do not use SP/CP yet.
-        vision_config.sequence_parallel = False
+        # Context parallel is not yet supported for the vision encoder.
+        # Sequence parallel is supported when the encoder TP size > 1; the
+        # vision_config inherits sequence_parallel from the base config
+        # (args.sequence_parallel) – ColumnParallelLinear will automatically
+        # disable SP when TP world size == 1.
         vision_config.context_parallel_size = 1
         vision_config.tp_comm_overlap = False
 

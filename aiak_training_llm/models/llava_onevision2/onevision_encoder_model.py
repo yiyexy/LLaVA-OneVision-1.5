@@ -1,4 +1,6 @@
 import torch
+from megatron.core import parallel_state, tensor_parallel
+from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.models.common.vision_module.vision_module import VisionModule
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import AttnMaskType, ModelType
@@ -256,8 +258,16 @@ class OneVisionEncoderModel(VisionModule):
             post_process=False,
         )
 
-        # Pre-layer normalization applied before transformer blocks
-        self.pre_layernorm = torch.nn.LayerNorm(config.hidden_size, eps=1e-4)
+        # Pre-layer normalization applied before transformer blocks.
+        # Use TENorm (TE-backed LayerNorm or RMSNorm, selected via
+        # config.normalization) instead of torch.nn.LayerNorm so that, when
+        # sequence_parallel is True, the SP flag is propagated to the underlying
+        # TE CUDA kernel.  This ensures the LayerNorm weight gradients are
+        # properly synchronised across TP ranks (each rank only sees S/TP tokens;
+        # without SP-aware parameter marking the per-rank gradients would not be
+        # reduced, leading to incorrect weight updates).  eps=1e-4 matches the
+        # original torch.nn.LayerNorm value.
+        self.pre_layernorm = TENorm(config, config.hidden_size, eps=1e-4)    # TODO: Confirm that config.normalization and hidden_size are correctly set for TENorm.
 
     def set_input_tensor(self, input_tensor: torch.Tensor) -> None:
         """
@@ -267,6 +277,71 @@ class OneVisionEncoderModel(VisionModule):
             input_tensor (torch.Tensor): Input tensor from previous pipeline stage.
         """
         self.decoder.set_input_tensor(input_tensor)
+
+    def _scatter_for_sequence_parallel(
+        self,
+        x: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+        """Pad token tensors to a TP-size multiple and scatter across TP ranks.
+        
+        When ``config.sequence_parallel`` is True the ``ColumnParallelLinear``
+        layers inside the ``TransformerBlock`` expect the input to be already
+        scattered along the first (token) dimension.  This helper pads all
+        token-indexed tensors so that ``total_tokens`` is divisible by
+        ``tp_size``, then performs the scatter.
+        
+        Args:
+            x: Hidden states of shape ``[total_tokens, 1, hidden]``.
+            rotary_pos_emb: RoPE frequencies of shape ``[total_tokens, half]``.
+            cu_seqlens: Packed-sequence cumulative lengths (int32 tensor).
+            
+        Returns:
+            Tuple of ``(x, rotary_pos_emb, cu_seqlens, total_tokens, sp_pad_size)``.
+            ``total_tokens`` is the *original* (pre-padding) count.
+            ``sp_pad_size`` is the number of padding tokens added (0 if none).
+        """
+        total_tokens = x.shape[0]
+        sp_pad_size = 0
+        if self.config.sequence_parallel:
+            tp_size = parallel_state.get_tensor_model_parallel_world_size()
+            # Pad to the next multiple of tp_size so scatter is evenly divisible.
+            sp_pad_size = (tp_size - total_tokens % tp_size) % tp_size
+            if sp_pad_size > 0:
+                # x: [total, 1, hidden] – pad along the token (first) dim.
+                x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, sp_pad_size))
+                # rotary_pos_emb: [total, half] – pad along the token (first) dim.
+                rotary_pos_emb = torch.nn.functional.pad(rotary_pos_emb, (0, 0, 0, sp_pad_size))
+                # Append a dummy sequence entry so the packed-sequence attention
+                # kernel processes every element in the padded tensor.
+                cu_seqlens = torch.cat([cu_seqlens, cu_seqlens[-1:] + sp_pad_size])
+            # Scatter x along the token (first) dimension across TP ranks.
+            x = tensor_parallel.scatter_to_sequence_parallel_region(x)
+        return x, rotary_pos_emb, cu_seqlens, total_tokens, sp_pad_size
+
+    def _gather_from_sequence_parallel(
+        self,
+        x: torch.Tensor,
+        total_tokens: int,
+        sp_pad_size: int,
+    ) -> torch.Tensor:
+        """Gather and de-pad after a sequence-parallel transformer block.
+        
+        Args:
+            x: Scattered output of shape ``[total_padded/tp, 1, hidden]``.
+            total_tokens: Original (pre-padding) token count.
+            sp_pad_size: Number of padding tokens that were appended before
+                scattering (0 if none).
+                
+        Returns:
+            Tensor of shape ``[total_tokens, 1, hidden]``.
+        """
+        if self.config.sequence_parallel:
+            x = tensor_parallel.gather_from_sequence_parallel_region(x)
+            if sp_pad_size > 0:
+                x = x[:total_tokens]
+        return x
 
     def forward(
         self, x: torch.Tensor, grid_thw: torch.Tensor, patch_positions: list[torch.Tensor] | None = None
@@ -375,7 +450,26 @@ class OneVisionEncoderModel(VisionModule):
         # Add sequence dimension:  [s, h] -> [s, 1, h]
         x = x[:, None, :].contiguous()
 
-        # Apply pre-layer normalization
+        # Pad and scatter for sequence parallel.  The TransformerBlock's
+        # TELayerNormColumnParallelLinear layers expect the input to be
+        # pre-scattered along the token (first) dimension; they all-gather
+        # before QKV/MLP projection.  Scattering here (before pre_layernorm)
+        # avoids an unnecessary full-sequence all-gather at the start of the
+        # first decoder layer, since LayerNorm normalises each token
+        # independently (over the hidden dimension) and gives the same result
+        # whether applied to the full sequence or to a local shard.
+        # cu_seqlens and rotary_pos_emb are padded to the next TP-size multiple
+        # and replicated across all ranks (not scattered), so that the packed-
+        # sequence attention kernel on each rank can access the complete sequence
+        # metadata.
+        x, rotary_pos_emb, cu_seqlens, total_tokens, sp_pad_size = (
+            self._scatter_for_sequence_parallel(x, rotary_pos_emb, cu_seqlens)
+        )
+
+        # Apply pre-layer normalization on the local (possibly scattered) shard.
+        # Because LayerNorm normalises over the hidden dimension only (per token),
+        # the result is identical to normalising the full sequence; there is no
+        # need for any cross-rank communication here.
         x = self.pre_layernorm(x)
 
         # Pass through transformer with packed sequence parameters
@@ -393,6 +487,9 @@ class OneVisionEncoderModel(VisionModule):
             attention_mask=None,
             attn_mask_type=AttnMaskType.no_mask,
         )
+
+        # Gather output back to the full sequence and remove any SP padding.
+        x = self._gather_from_sequence_parallel(x, total_tokens, sp_pad_size)
 
         # Remove sequence dimension:  [s, 1, h] -> [s, h]
         x = x[:, 0, :].contiguous()
@@ -560,7 +657,15 @@ class OneVisionEncoderModel(VisionModule):
         x = x[:, None, :].contiguous()  # [s, h] -> [s, 1, h]
         output["before_pre_layernorm"] = x.clone()
 
-        # Apply pre-layer normalization
+        # Pad and scatter for sequence parallel (mirrors forward()).
+        # Scatter before pre_layernorm so the decoder's first
+        # TELayerNormColumnParallelLinear receives already-scattered input and
+        # does not need to immediately all-gather what was just scattered.
+        x, rotary_pos_emb, cu_seqlens, total_tokens, sp_pad_size = (
+            self._scatter_for_sequence_parallel(x, rotary_pos_emb, cu_seqlens)
+        )
+
+        # Apply pre-layer normalization on the (possibly scattered) local shard.
         x = self.pre_layernorm(x)
         output["after_pre_layernorm"] = x.clone()
 
@@ -584,6 +689,10 @@ class OneVisionEncoderModel(VisionModule):
         # Extract layer outputs and final output from decoder
         output["layer_outputs"] = decoder_debug_output.get("layer_outputs", {})
         x = decoder_debug_output.get("final_output", decoder_debug_output.get("before_final_layernorm", x))
+        
+        # Gather output back to full sequence and remove any SP padding.
+        x = self._gather_from_sequence_parallel(x, total_tokens, sp_pad_size)
+
         output["after_decoder"] = x.clone()
 
         # Remove sequence dimension

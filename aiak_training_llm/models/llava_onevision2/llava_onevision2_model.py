@@ -3,7 +3,7 @@ from collections import namedtuple
 from functools import partial
 
 import torch
-from megatron.core import InferenceParams
+from megatron.core import InferenceParams, tensor_parallel, parallel_state
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import AttnMaskType
@@ -127,6 +127,7 @@ class LlavaOnevision2(MegatronModule):
                 post_process=self.post_process,
                 rotary_base=language_rotary_base,
                 share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+                scatter_embedding_sequence_parallel=False,
             )
             self.share_embeddings_and_output_weights = self.language_model.share_embeddings_and_output_weights
 
@@ -233,8 +234,22 @@ class LlavaOnevision2(MegatronModule):
 
                 n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
                 n_image_features = image_embeddings.shape[0]
-                if n_image_tokens != n_image_features:
-                    raise ValueError(f"Image features {n_image_features} != image tokens {n_image_tokens}")
+                if n_image_features > n_image_tokens:
+                    # Trim any extra embeddings produced by ViT SP-padding tokens that
+                    # passed through the adapter.  The language sequence has a fixed
+                    # number of image-token slots (n_image_tokens); any embeddings
+                    # beyond that count must not enter the fusion step.
+                    logging.getLogger(__name__).warning(
+                        "Trimming %d extra image embedding(s) (n_image_features=%d, "
+                        "n_image_tokens=%d); likely caused by ViT SP-padding tokens "
+                        "passing through the adapter.",
+                        n_image_features - n_image_tokens,
+                        n_image_features,
+                        n_image_tokens,
+                    )
+                    image_embeddings = image_embeddings[:n_image_tokens]
+                elif n_image_features < n_image_tokens:
+                    raise ValueError(f"Image features {n_image_features} < image tokens {n_image_tokens}")
 
                 # If running inference, the language model KV cache will be updated for image token positions.
                 # Here we store the image tokens sequence length, which can be used as an offset to the KV cache later.
@@ -281,6 +296,20 @@ class LlavaOnevision2(MegatronModule):
             if self.config.context_parallel_size > 1:
                 combined_embeddings = get_inputs_on_this_cp_rank(combined_embeddings)
 
+            if self.config.sequence_parallel:
+                # Ensure sequence length is divisible by TP world size before scattering.
+                seq_len = combined_embeddings.size(0)
+                tp_world_size = parallel_state.get_tensor_model_parallel_world_size()
+                remainder = seq_len % tp_world_size
+                if remainder != 0:
+                    pad = tp_world_size - remainder
+                    pad_shape = (pad,) + combined_embeddings.shape[1:]
+                    pad_tensor = combined_embeddings.new_zeros(pad_shape)
+                    combined_embeddings = torch.cat((combined_embeddings, pad_tensor), dim=0)
+                combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
+                    combined_embeddings
+                )
+        
         else:
             combined_embeddings = None
             input_tensor = self.language_model.decoder.input_tensor

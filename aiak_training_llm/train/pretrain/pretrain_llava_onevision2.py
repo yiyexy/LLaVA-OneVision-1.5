@@ -4,6 +4,7 @@ import os
 from functools import partial
 
 import torch
+import torch.nn.functional as F
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -166,6 +167,44 @@ def get_batch(data_iterator):
             max_seqlen_q=max_lengths[0].item(),
             max_seqlen_kv=max_lengths[0].item(),
         )
+
+    # Pad sequence for Sequence Parallelism (SP) divisibility.
+    # SP requires sequence length to be divisible by TP size;
+    # when combined with CP, it must be divisible by TP * CP * 2.
+    # This padding is required for both non-packed and packed sequences because
+    # scatter_to_sequence_parallel_region asserts divisibility by TP size.
+    if args.sequence_parallel:
+        tp_size = args.tensor_model_parallel_size
+        cp_size = args.context_parallel_size
+        if cp_size > 1:
+            padding_factor = tp_size * cp_size * 2
+        else:
+            padding_factor = tp_size
+        seq_len = tokens.shape[1]
+        if seq_len % padding_factor != 0:
+            padded_len = (seq_len + padding_factor - 1) // padding_factor * padding_factor
+            pad_size = padded_len - seq_len
+            pad_token_id = getattr(args, "pad_token_id", 0)
+            tokens = F.pad(tokens, (0, pad_size), value=pad_token_id)
+            labels = F.pad(labels, (0, pad_size), value=-100)
+            loss_mask = F.pad(loss_mask, (0, pad_size))
+            if packed_seq_params is not None:
+                # Append a dummy sequence entry so the packed-sequence attention
+                # kernel covers every element in the padded tensor.
+                # cu_seqlens ends with the original total token count; adding a
+                # new entry at (original_total + pad_size) represents the padding
+                # tokens as one extra sequence.
+                new_end_q = packed_seq_params.cu_seqlens_q[-1:] + pad_size
+                new_end_kv = packed_seq_params.cu_seqlens_kv[-1:] + pad_size
+                max_seqlen_q = max(packed_seq_params.max_seqlen_q, pad_size)
+                max_seqlen_kv = max(packed_seq_params.max_seqlen_kv, pad_size)
+                packed_seq_params = PackedSeqParams(
+                    qkv_format=packed_seq_params.qkv_format,
+                    cu_seqlens_q=torch.cat([packed_seq_params.cu_seqlens_q, new_end_q]),
+                    cu_seqlens_kv=torch.cat([packed_seq_params.cu_seqlens_kv, new_end_kv]),
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_kv=max_seqlen_kv,
+                )
 
     if args.context_parallel_size > 1:
         labels = get_inputs_on_this_cp_rank(labels.transpose(0, 1)).transpose(0, 1)
