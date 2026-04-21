@@ -283,15 +283,15 @@ class Qwen2VLTaskEncoder(TaskEncoder):
             new_parts.append(VISION_TAGS[0])
             new_parts.append(IMAGE_TOKEN * count)
             new_parts.append(VISION_TAGS[1])
-            new_parts.append('\n')
-        new_vision_str = ''.join(new_parts)
+            new_parts.append("\n")
+        new_vision_str = "".join(new_parts)
 
         # Find and replace the entire vision region in the message content.
         # Original: VS...VE\nVS...VE\n...VS...VE\n\nDescribe...
         # We replace from the first VS through the last VE + one \n,
         # and our new_vision_str already ends with \n for each frame.
         for msg in messages:
-            content = msg.get('content', '')
+            content = msg.get("content", "")
             if not isinstance(content, str) or VISION_TAGS[0] not in content:
                 continue
 
@@ -299,14 +299,16 @@ class Qwen2VLTaskEncoder(TaskEncoder):
             last_ve_end = content.rfind(VISION_TAGS[1]) + len(VISION_TAGS[1])
             # Skip one \n after the last VE (our new string already provides it)
             tail_start = last_ve_end
-            if tail_start < len(content) and content[tail_start] == '\n':
+            if tail_start < len(content) and content[tail_start] == "\n":
                 tail_start += 1
 
-            msg['content'] = content[:first_vs] + new_vision_str + content[tail_start:]
+            msg["content"] = content[:first_vs] + new_vision_str + content[tail_start:]
             break  # only process the first message with vision content
         return messages
 
-    def process_sft_qa(self, messages: list, system: str, raw_video: list, raw_image: list, raw_patch_positions: list, **kwargs):
+    def process_sft_qa(
+        self, messages: list, system: str, raw_video: list, raw_image: list, raw_patch_positions: list, **kwargs
+    ):
         """process the data for sft qa"""
         video_grid_thw = None
         pixel_values_videos = []
@@ -325,7 +327,6 @@ class Qwen2VLTaskEncoder(TaskEncoder):
                 if i is not None:
                     patch_positions.append(torch.tensor(i, dtype=torch.int64))
 
-
         messages, mm_inputs = self.chat_template.mm_plugin.process_messages(
             messages,
             image,
@@ -336,11 +337,11 @@ class Qwen2VLTaskEncoder(TaskEncoder):
         if has_image_inputs:
             image_grid_thw = mm_inputs.get("image_grid_thw")
             assert image_grid_thw is not None, (
-                    "Missing `image_grid_thw` in multimodal inputs:\n"
-                    f"- num_raw_image: {len(raw_image)}\n"
-                    f"- mm_input_keys: {list(mm_inputs.keys())}\n"
-                    f"- has_image_placeholder: {any('<image>' in msg.get('content', '') for msg in messages)}"
-                )
+                "Missing `image_grid_thw` in multimodal inputs:\n"
+                f"- num_raw_image: {len(raw_image)}\n"
+                f"- mm_input_keys: {list(mm_inputs.keys())}\n"
+                f"- has_image_placeholder: {any('<image>' in msg.get('content', '') for msg in messages)}"
+            )
             # get image patch num:
             num_patches = 0
             for img_idx in range(len(image_grid_thw)):
@@ -348,10 +349,10 @@ class Qwen2VLTaskEncoder(TaskEncoder):
                 num_patches += h_val * w_val
             pixel_values = mm_inputs.get("pixel_values")
             assert pixel_values is not None, (
-                    "Missing `pixel_values` in multimodal inputs:\n"
-                    f"- num_raw_image: {len(raw_image)}\n"
-                    f"- mm_input_keys: {list(mm_inputs.keys())}"
-                )
+                "Missing `pixel_values` in multimodal inputs:\n"
+                f"- num_raw_image: {len(raw_image)}\n"
+                f"- mm_input_keys: {list(mm_inputs.keys())}"
+            )
             pixel_values_images = [pixel_values]
             if len(patch_positions) == 0:
                 # Generate default patch_positions from image_grid_thw, with t=0 for all patches
@@ -371,24 +372,22 @@ class Qwen2VLTaskEncoder(TaskEncoder):
                     )
                     patch_positions.append(img_patch_positions)
             else:
-                image_grid_thw = torch.tensor([[len(image_grid_thw),image_grid_thw[0][1],image_grid_thw[0][2]]])
+                image_grid_thw = torch.tensor([[len(image_grid_thw), image_grid_thw[0][1], image_grid_thw[0][2]]])
                 # Apply block layout conversion for temporal contiguity after spatial merge
                 flat_positions = torch.cat(patch_positions, dim=0)
                 t_v, h_v, w_v = int(image_grid_thw[0][0]), int(image_grid_thw[0][1]), int(image_grid_thw[0][2])
-                flat_positions = convert_positions_to_block_layout(
-                    flat_positions, t_v, h_v, w_v, spatial_merge_size=2
-                )
+                flat_positions = convert_positions_to_block_layout(flat_positions, t_v, h_v, w_v, spatial_merge_size=2)
                 patch_positions = [flat_positions]
             patch_positions_sum = sum(len(p) for p in patch_positions)
             assert num_patches == patch_positions_sum, (
-                    "num_patches mismatch:\n"
-                    f"- num_patches: {num_patches}\n"
-                    f"- patch_positions_sum: {patch_positions_sum}\n"
-                    f"- len(image_grid_thw): {len(image_grid_thw)}\n"
-                    f"- patch_positions len: {len(patch_positions)}\n"
-                    f"- image_grid_thw[-1]: {image_grid_thw[-1]}\n"
-                    f"- image_sizes: {[img.size for img in image]}"
-                )
+                "num_patches mismatch:\n"
+                f"- num_patches: {num_patches}\n"
+                f"- patch_positions_sum: {patch_positions_sum}\n"
+                f"- len(image_grid_thw): {len(image_grid_thw)}\n"
+                f"- patch_positions len: {len(patch_positions)}\n"
+                f"- image_grid_thw[-1]: {image_grid_thw[-1]}\n"
+                f"- image_sizes: {[img.size for img in image]}"
+            )
 
         # Compute timestamps and rewrite vision blocks by frame in the message text.
         # This rewrites mm_plugin's per-canvas wrapping (VS PAD*N VE \n VS PAD*M VE \n ...)
@@ -396,12 +395,13 @@ class Qwen2VLTaskEncoder(TaskEncoder):
         # level, before tokenization — no token-level merge/split needed.
         timestamp_strings = None
         if kwargs is not None and "fps" in kwargs and len(patch_positions) > 0:
-            fps = kwargs['fps'][0] if isinstance(kwargs['fps'], list) else kwargs['fps']
+            fps = kwargs["fps"][0] if isinstance(kwargs["fps"], list) else kwargs["fps"]
             if fps is not None and fps > 0:
+                td = kwargs.get("timestamp_decimal", 1) or 1
                 pt_patch_position = torch.cat(patch_positions)
                 timestamps = self.compute_frame_timestamps(patch_positions, pt_patch_position, fps)
-                timestamps = [round(t, 1) for t in timestamps]
-                timestamp_strings = [f"<{t:.1f} seconds>" for t in timestamps]
+                timestamps = [round(t, td) for t in timestamps]
+                timestamp_strings = [f"<{t:.{td}f} seconds>" for t in timestamps]
 
         if timestamp_strings is not None and len(timestamp_strings) > 0 and len(patch_positions) > 0:
             messages = self._rewrap_vision_by_frame(messages, patch_positions, timestamp_strings)
@@ -506,7 +506,9 @@ class Qwen2VLTaskEncoder(TaskEncoder):
             num_tiles = []
             kwargs = {}
             if hasattr(sample, "fps") and sample.fps is not None:
-                kwargs['fps'] = sample.fps
+                kwargs["fps"] = sample.fps
+            if hasattr(sample, "timestamp_decimal") and sample.timestamp_decimal is not None:
+                kwargs["timestamp_decimal"] = sample.timestamp_decimal
 
             def _remove_last_qa_round(messages: list[dict]) -> list[dict]:
                 assistant_idx = -1
@@ -558,10 +560,10 @@ class Qwen2VLTaskEncoder(TaskEncoder):
 
                 current_messages = _remove_last_qa_round(current_messages)
                 assert len(current_messages) > 0, (
-                        "Sample has no QA rounds left after truncation to fit seq_length:\n"
-                        f"- sample: {sample.__key__}\n"
-                        f"- seq_length: {self.args.seq_length}"
-                    )
+                    "Sample has no QA rounds left after truncation to fit seq_length:\n"
+                    f"- sample: {sample.__key__}\n"
+                    f"- seq_length: {self.args.seq_length}"
+                )
 
                 image_placeholder_count = sum(
                     message.get("content", "").count(constants.Placeholder.IMAGE) for message in current_messages
@@ -599,12 +601,12 @@ class Qwen2VLTaskEncoder(TaskEncoder):
         elif image_grid_thw is not None:
             image_token_len = int(image_grid_thw.prod(dim=-1).sum().item() / 4)
             assert image_token_len <= self.args.seq_length, (
-                    "Image token length exceeds seq_length:\n"
-                    f"- sample: {sample.__key__}\n"
-                    f"- image_grid_thw: {image_grid_thw}\n"
-                    f"- image_token_len: {image_token_len}\n"
-                    f"- seq_length: {self.args.seq_length}"
-                )
+                "Image token length exceeds seq_length:\n"
+                f"- sample: {sample.__key__}\n"
+                f"- image_grid_thw: {image_grid_thw}\n"
+                f"- image_token_len: {image_token_len}\n"
+                f"- seq_length: {self.args.seq_length}"
+            )
 
         return Qwen2VLImageTaskSample(
             __key__=sample.__key__,

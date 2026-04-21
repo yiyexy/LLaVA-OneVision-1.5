@@ -8,6 +8,7 @@ Expected JSONL fields (per line):
 - images: List[path] (frame images or still images)
 - patch_positions: Optional[List[path]] (npy files)
 - fps: float|int (required)
+- timestamp_decimal: int (optional, 1 or 2, default 1)
 
 This script writes WebDataset shards and a minimal Megatron-Energon config
 for MultiMixQASample, with an auto-generated sample_loader.
@@ -86,6 +87,7 @@ def sample_loader(sample: dict) -> dict:
 		system=system,
 		image=images if len(images) > 0 else None,
 		fps=data.get('fps'),
+		timestamp_decimal=data.get('timestamp_decimal'),
 	)
 	if patch_positions is not None:
 		result['patch_positions'] = patch_positions
@@ -153,7 +155,9 @@ def _normalize_list(value: object | None) -> list[str]:
     return list(value)
 
 
-def _build_sample(entry: dict, idx: int, image_root: str | None, sample_prefix: str) -> dict:
+def _build_sample(
+    entry: dict, idx: int, image_root: str | None, sample_prefix: str, default_timestamp_decimal: int | None = None
+) -> dict:
     """Build one sample."""
     sample_id = entry.get("id") or f"{sample_prefix}{idx}"
     sample_id = sample_id.replace(".", "_")
@@ -187,11 +191,16 @@ def _build_sample(entry: dict, idx: int, image_root: str | None, sample_prefix: 
     if fps is None:
         raise ValueError(f"Missing required field 'fps' in sample: {sample_id}")
 
+    # Per-sample JSONL field takes priority; fall back to CLI default
+    timestamp_decimal = entry.get("timestamp_decimal") or default_timestamp_decimal
+
     payload = {
         "messages": messages,
         "image_keys": image_keys,
         "fps": fps,
     }
+    if timestamp_decimal is not None:
+        payload["timestamp_decimal"] = timestamp_decimal
     logging.info(payload["fps"])
     if patch_positions_keys:
         payload["patch_positions_keys"] = patch_positions_keys
@@ -215,11 +224,12 @@ def _process_chunk(
     image_root: str | None,
     sample_prefix: str,
     worker_id: int,
+    default_timestamp_decimal: int | None = None,
 ) -> tuple[int, int]:
     count = 0
     with wds.ShardWriter(tar_pattern, maxcount=maxcount, maxsize=maxsize, verbose=0) as shard_writer:
         for idx, entry in enumerate(iter_jsonl(chunk_path)):
-            sample = _build_sample(entry, idx, image_root, sample_prefix)
+            sample = _build_sample(entry, idx, image_root, sample_prefix, default_timestamp_decimal)
             shard_writer.write(sample)
             count += 1
             if _COUNTER is not None and count % 50 == 0:
@@ -277,6 +287,7 @@ def convert_jsonl_to_wds(
     image_root: str | None,
     num_workers: int,
     keep_chunks: bool,
+    default_timestamp_decimal: int | None = None,
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
 
@@ -293,6 +304,7 @@ def convert_jsonl_to_wds(
                 image_root,
                 sample_prefix="sample_",
                 worker_id=0,
+                default_timestamp_decimal=default_timestamp_decimal,
             )
             with counter.get_lock():
                 pbar.n = counter.value
@@ -316,6 +328,7 @@ def convert_jsonl_to_wds(
                         image_root,
                         f"sample_{worker_id:02d}_",
                         worker_id,
+                        default_timestamp_decimal,
                     )
                 )
             results_async = pool.starmap_async(_process_chunk, args_list)
@@ -357,6 +370,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep temporary split jsonl chunks",
     )
+    parser.add_argument(
+        "--timestamp_decimal",
+        type=int,
+        default=None,
+        choices=[1, 2],
+        help="Default timestamp decimal places (1 or 2). Per-sample JSONL field overrides this value.",
+    )
     return parser.parse_args()
 
 
@@ -370,6 +390,7 @@ def main() -> None:
         image_root=args.image_root,
         num_workers=args.num_workers,
         keep_chunks=args.keep_chunks,
+        default_timestamp_decimal=args.timestamp_decimal,
     )
 
 

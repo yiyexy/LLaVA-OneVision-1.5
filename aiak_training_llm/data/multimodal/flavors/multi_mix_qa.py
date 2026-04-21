@@ -1,4 +1,4 @@
-""" MultiMixQASample """
+"""MultiMixQASample"""
 
 from dataclasses import dataclass
 from typing import List, Optional, Union
@@ -29,3 +29,6 @@ class MultiMixQASample(Sample):
 
     #: The frames per second of the video
     fps: Optional[Union[float, int]] = None
+
+    #: Number of decimal places for frame timestamps (1 or 2, default 1)
+    timestamp_decimal: Optional[int] = None
