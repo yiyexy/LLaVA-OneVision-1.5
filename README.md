@@ -244,7 +244,7 @@ Download our `LLaVA-OneVision-1.5-4B-stage0` model directly from [Hugging Face](
 #### Option 2: Merge initial weights yourself
 Alternatively, you can merge the initial weights from the original ViT and LLM:
 ```bash
-python ds/merge_model.py \
+python transformers_impl/merge_model.py \
 --vit_path DeepGlint-AI/rice-vit-large-patch14-560 \
 --llm_path Qwen/Qwen3-4B-Instruct-2507 \
 --output LLaVA-OneVision-1.5-4B-stage0

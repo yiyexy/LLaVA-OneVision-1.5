@@ -97,5 +97,29 @@ examples/llava_onevision2/quick_start_video_2b/*.yaml
 tools/validate_jsonl.py
 examples/llava_onevision2/grounding*
 
+yaml_datasets
 
-examples/llava_onevision2/qwen3_4b/mix_*
+# On-demand synthetic test fixtures (built via tests/fixtures/build_tiny_triplet.py)
+tests/fixtures/tiny-dense/
+tests/fixtures/tiny-moe/
+
+# Internal-only skills containing real paths, IPs, credentials, NFS endpoints
+.opencode/skills/*-glintlab/
+
+# Sisyphus / OpenCode local state
+.sisyphus/
+.opencode/package-lock.json
+
+# Local docker / node helper scripts
+run_docker_local_wogpus.sh
+check_nodes.sh
+monitor_upload.sh
+upload_azuredata.py
+
+# Local data path manifests and ad-hoc lists
+date_*.txt
+*.list
+mid_training_video*.list
+
+# Offline packing local logs
+offline_packing/*.log
