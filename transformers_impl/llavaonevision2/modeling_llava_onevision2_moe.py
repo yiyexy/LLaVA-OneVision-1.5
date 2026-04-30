@@ -1,31 +1,27 @@
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn import LayerNorm
 
 from transformers import AutoModel
 from transformers.cache_utils import Cache
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling, ModelOutput
-from transformers.modeling_utils import PreTrainedModel
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.models.siglip.modeling_siglip import SiglipMLP
 from transformers.processing_utils import Unpack
 from transformers.utils import (
     TransformersKwargs,
     auto_docstring,
     can_return_tuple,
-    is_flash_attn_2_available,
     replace_return_docstrings,
 )
+from transformers.utils.generic import is_flash_attention_requested
 
 from .configuration_llava_onevision2_moe import LlavaOnevision2MoeConfig, LlavaOnevision2VisionConfig
-
-
-if is_flash_attn_2_available():
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
 
 
 @dataclass
@@ -108,6 +104,7 @@ class VisionRotaryEmbedding(nn.Module):
 
         self.head_dim = head_dim
         self.half = half
+        self.base = base
 
         # 4:6:6 split for T:H:W
         unit = half // 16
@@ -280,7 +277,7 @@ class LlavaOnevision2VisionPatchMerger(nn.Module):
         self,
         dim: int,
         context_dim: int,
-        spatial_merge_size: int = 2,
+        spatial_merge_size: int = 3,
         layer_norm_eps: float = 1e-05,
         use_patch_position_encoding: bool = False,
         patch_position_encoding_type: str = "absolute",
@@ -374,198 +371,32 @@ def apply_rotary_pos_emb(q, k, freqs):
     return q_embed, k_embed
 
 
-def convert_rope_to_block_layout(
-    freqs: torch.Tensor, t: int, h: int, w: int, spatial_merge_size: int = 2
-) -> torch.Tensor:
+def eager_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs,
+):
+    """Eager attention; query/key/value are expected as ``(B, H, L, D)``."""
+    attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = torch.matmul(attn_weights, value)
+    attn_output = attn_output.transpose(1, 2).contiguous()  # (B, L, H, D)
+    return attn_output, attn_weights
+
+
+class OneVisionEncoderAttention(nn.Module):
     """
-    Convert RoPE from row-major order (1x1 layout) to 2x2 block layout.
-
-    The image processor arranges patches in 2x2 blocks when spatial_merge_size=2:
-    - Row-major order: [p(0,0), p(0,1), p(0,2), p(0,3), ..., p(1,0), p(1,1), ...]
-    - Block order: [p(0,0), p(0,1), p(1,0), p(1,1)], [p(0,2), p(0,3), p(1,2), p(1,3)], ...
-
-    Args:
-        freqs: RoPE frequencies in row-major order, shape [t*h*w, half]
-        t: temporal dimension
-        h: height (unmerged patch count)
-        w: width (unmerged patch count)
-        spatial_merge_size: size of spatial merge blocks (default: 2)
-
-    Returns:
-        torch.Tensor: RoPE frequencies in 2x2 block order, same shape [t*h*w, half]
-    """
-    sms = spatial_merge_size
-    if sms == 1:
-        return freqs
-
-    half = freqs.shape[-1]
-
-    # freqs shape: [t*h*w, half]
-    # Reshape to [t, h, w, half]
-    freqs = freqs.view(t, h, w, half)
-
-    # Calculate merged dimensions
-    h_merged = h // sms
-    w_merged = w // sms
-
-    # Reshape to [t, h_merged, sms, w_merged, sms, half]
-    freqs = freqs.view(t, h_merged, sms, w_merged, sms, half)
-
-    # Permute to [t, h_merged, w_merged, sms_h, sms_w, half] - 2x2 block order
-    freqs = freqs.permute(0, 1, 3, 2, 4, 5).contiguous()
-
-    # Reshape back to [t*h*w, half]
-    freqs = freqs.view(t * h * w, half)
-
-    return freqs
-
-
-def convert_rope_to_block_layout_by_positions(
-    freqs: torch.Tensor,
-    patch_positions: torch.Tensor,
-    spatial_merge_size: int = 2,
-    grid_thw: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """
-    Convert RoPE from row-major order to 2x2 block layout.
-
-    When grid_thw is provided, use it directly to determine the dense canvas/frame
-    dimensions (t, h, w) for the spatial reorder. This is correct for:
-      - Normal video:  grid_thw = [[T, H, W]]
-      - Codec video:   grid_thw = [[n_canvases, hb, wb]]
-      - Images:        grid_thw = [[1, H1, W1], [1, H2, W2], ...]
-
-    The block layout reorder is purely spatial (standard raster -> 2x2 block raster)
-    and depends only on canvas (h, w), NOT on per-patch frame_id.
-
-    Falls back to position-based frame_id grouping only when grid_thw is not available.
-
-    Args:
-        freqs: RoPE frequencies in row-major order, shape [seq_len, half]
-        patch_positions: Patch positions tensor, shape [seq_len, 3] with [t, h, w] for each patch
-        spatial_merge_size: size of spatial merge blocks (default: 2)
-        grid_thw: Grid sizes tensor of shape [num_samples, 3] with [t, h, w] for each sample.
-
-    Returns:
-        torch.Tensor: RoPE frequencies in 2x2 block order, same shape [seq_len, half]
-    """
-    sms = spatial_merge_size
-    if sms == 1:
-        return freqs
-
-    # ---- Primary path: use grid_thw directly (correct for all cases) ----
-    if grid_thw is not None:
-        num_samples = grid_thw.shape[0]
-
-        # Fast path: single sample (most common)
-        if num_samples == 1:
-            t = grid_thw[0, 0].item()
-            h = grid_thw[0, 1].item()
-            w = grid_thw[0, 2].item()
-            return convert_rope_to_block_layout(freqs, t=t, h=h, w=w, spatial_merge_size=sms)
-
-        # Check if all samples share the same (h, w) — common for video frames
-        all_same_hw = (
-            torch.all(grid_thw[:, 1] == grid_thw[0, 1]).item() and torch.all(grid_thw[:, 2] == grid_thw[0, 2]).item()
-        )
-        if all_same_hw:
-            total_t = grid_thw[:, 0].sum().item()
-            h = grid_thw[0, 1].item()
-            w = grid_thw[0, 2].item()
-            return convert_rope_to_block_layout(freqs, t=total_t, h=h, w=w, spatial_merge_size=sms)
-
-        # Slow path: different spatial sizes per sample (e.g. mixed image resolutions)
-        result = torch.empty_like(freqs)
-        offset = 0
-        for i in range(num_samples):
-            t = grid_thw[i, 0].item()
-            h = grid_thw[i, 1].item()
-            w = grid_thw[i, 2].item()
-            n = int(t * h * w)
-            result[offset : offset + n] = convert_rope_to_block_layout(
-                freqs[offset : offset + n], t=t, h=h, w=w, spatial_merge_size=sms
-            )
-            offset += n
-        return result
-
-    # ---- Fallback path: no grid_thw, group by frame_id from patch_positions ----
-    half = freqs.shape[-1]
-    seq_len = freqs.shape[0]
-
-    t_indices = patch_positions[:, 0]
-    unique_t, inverse_indices, counts = torch.unique_consecutive(t_indices, return_inverse=True, return_counts=True)
-    num_groups = unique_t.shape[0]
-
-    # Single image, square
-    if num_groups == 1:
-        hw = int(seq_len**0.5)
-        if hw * hw == seq_len:
-            return convert_rope_to_block_layout(freqs, t=1, h=hw, w=hw, spatial_merge_size=sms)
-
-    # All groups same size
-    first_count = counts[0].item()
-    all_same_size = torch.all(counts == first_count).item()
-
-    if all_same_size:
-        group_size = first_count
-        hw = int(group_size**0.5)
-        if hw * hw == group_size:
-            return convert_rope_to_block_layout(freqs, t=num_groups, h=hw, w=hw, spatial_merge_size=sms)
-
-    # Variable frame sizes
-    cum_counts = torch.cumsum(counts, dim=0)
-    start_indices = torch.cat([torch.tensor([0], device=counts.device), cum_counts[:-1]])
-    result_freqs = torch.empty_like(freqs)
-
-    for group_idx in range(num_groups):
-        start_idx = start_indices[group_idx].item()
-        group_size = counts[group_idx].item()
-        end_idx = start_idx + group_size
-
-        hw = int(group_size**0.5)
-        if hw * hw == group_size:
-            h, w = hw, hw
-        else:
-            h, w = _infer_hw_from_positions(patch_positions[start_idx:end_idx], sms)
-
-        result_freqs[start_idx:end_idx] = convert_rope_to_block_layout(
-            freqs[start_idx:end_idx], t=1, h=h, w=w, spatial_merge_size=sms
-        )
-
-    return result_freqs
-
-
-def _infer_hw_from_positions(group_positions: torch.Tensor, spatial_merge_size: int = 2) -> tuple[int, int]:
-    """
-    Infer height and width from patch positions within a temporal group.
-
-    Args:
-        group_positions: Patch positions for one temporal group, shape [group_size, 3]
-        spatial_merge_size: size of spatial merge blocks
-
-    Returns:
-        tuple[int, int]: (height, width) of the spatial grid
-    """
-    # Get unique h and w values
-    h_values = group_positions[:, 1]
-    w_values = group_positions[:, 2]
-
-    h_unique = torch.unique(h_values)
-    w_unique = torch.unique(w_values)
-
-    h = h_unique.shape[0]
-    w = w_unique.shape[0]
-
-    # Validate dimensions are divisible by spatial_merge_size
-    assert h % spatial_merge_size == 0, f"Height {h} not divisible by {spatial_merge_size}"
-    assert w % spatial_merge_size == 0, f"Width {w} not divisible by {spatial_merge_size}"
-
-    return h, w
-
-
-class OneVisionEncoderFlashAttention2(nn.Module):
-    """
-    Multi-headed attention with RoPE support using Flash Attention 2.
+    Multi-headed attention with RoPE support, dispatched through
+    :data:`ALL_ATTENTION_FUNCTIONS` (``eager`` / ``sdpa`` / ``flash_attention_2``)
+    based on ``config._attn_implementation``.
     """
 
     def __init__(self, config: LlavaOnevision2VisionConfig):
@@ -579,8 +410,11 @@ class OneVisionEncoderFlashAttention2(nn.Module):
                 f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`: {self.num_heads})."
             )
 
+        self.num_key_value_groups = 1  # required by repeat_kv-aware eager paths
         self.scale = self.head_dim**-0.5
-        self.dropout = config.attention_dropout
+        self.scaling = self.scale  # alias expected by some attention interfaces
+        self.attention_dropout = config.attention_dropout
+        self.is_causal = False
         self.qkv = nn.Linear(self.embed_dim, self.embed_dim * 3)
         self.proj = nn.Linear(self.embed_dim, self.embed_dim)
 
@@ -592,92 +426,91 @@ class OneVisionEncoderFlashAttention2(nn.Module):
         output_attentions: bool = False,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
+        **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Forward pass using Flash Attention 2.
-        """
         batch_size, q_len, _ = hidden_states.size()
+        # (B, L, 3*H*D) -> (B, L, 3, H, D) -> 3 x (B, L, H, D) -> 3 x (B, H, L, D)
         q, k, v = (
             self.qkv(hidden_states)
             .reshape(batch_size, q_len, 3, self.num_heads, self.head_dim)
             .permute(2, 0, 1, 3, 4)
             .unbind(0)
         )
+        query_states = q.transpose(1, 2)
+        key_states = k.transpose(1, 2)
+        value_states = v.transpose(1, 2)
 
-        # Flash Attention requires (B, L, H, D) format
-        query_states = q
-        key_states = k
-        value_states = v
-
-        # Apply RoPE if provided
         if rotary_pos_emb is not None:
-            # Transpose for RoPE application: (B, L, H, D) -> (B, H, L, D)
-            query_states = query_states.transpose(1, 2)
-            key_states = key_states.transpose(1, 2)
-            # NOTE: apply_rotary_pos_emb now ensures NO float32 cast happens
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, rotary_pos_emb)
-            # Transpose back: (B, H, L, D) -> (B, L, H, D)
-            query_states = query_states.transpose(1, 2)
-            key_states = key_states.transpose(1, 2)
 
-        # FIX: Removed the explicit float32 check and downcast.
-        # We assume input is already correct (bf16/fp16) thanks to RoPE fix.
+        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, eager_attention_forward
+        )
+        dropout = 0.0 if not self.training else self.attention_dropout
 
-        if cu_seqlens is not None:
-            query_states = query_states.reshape(-1, self.num_heads, self.head_dim)
-            key_states = key_states.reshape(-1, self.num_heads, self.head_dim)
-            value_states = value_states.reshape(-1, self.num_heads, self.head_dim)
-
-            attn_output = flash_attn_varlen_func(
+        if cu_seqlens is not None and is_flash_attention_requested(self.config):
+            # Flash Attention varlen path: pass cu_seq_lens / max_length kwargs.
+            if max_seqlen is None:
+                max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+            attn_output, _ = attention_interface(
+                self,
                 query_states,
                 key_states,
                 value_states,
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                dropout_p=self.dropout if self.training else 0.0,
-                softmax_scale=self.scale,
-                causal=False,
-            )
-            attn_output = attn_output.reshape(batch_size, q_len, self.embed_dim)
-
-        elif attention_mask is not None:
-            attn_mask = attention_mask
-            if attn_mask.dim() == 2:
-                attn_mask = attn_mask.unsqueeze(0)
-            if attn_mask.shape[0] == 1 and batch_size > 1:
-                attn_mask = attn_mask.expand(batch_size, -1, -1)
-            attn_mask = attn_mask.unsqueeze(1)
-
-            q_sdpa = query_states.transpose(1, 2)
-            k_sdpa = key_states.transpose(1, 2)
-            v_sdpa = value_states.transpose(1, 2)
-            attn_output = F.scaled_dot_product_attention(
-                q_sdpa,
-                k_sdpa,
-                v_sdpa,
-                attn_mask=attn_mask,
-                dropout_p=self.dropout if self.training else 0.0,
+                attention_mask=None,
+                scaling=self.scale,
+                dropout=dropout,
+                cu_seq_lens_q=cu_seqlens,
+                cu_seq_lens_k=cu_seqlens,
+                max_length_q=max_seqlen,
+                max_length_k=max_seqlen,
                 is_causal=False,
+                **kwargs,
             )
-            attn_output = attn_output.transpose(1, 2)
+        elif cu_seqlens is not None:
+            # Non-FA implementations do not understand cu_seqlens directly; mirror
+            # Qwen3-VL by splitting the packed sequence into per-sample chunks
+            # along the L dim of (B, H, L, D) and running attention per chunk.
+            lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+            splits = [torch.split(t, lengths, dim=2) for t in (query_states, key_states, value_states)]
+            attn_outputs = [
+                attention_interface(
+                    self,
+                    q_chunk,
+                    k_chunk,
+                    v_chunk,
+                    attention_mask=None,
+                    scaling=self.scale,
+                    dropout=dropout,
+                    is_causal=False,
+                    **kwargs,
+                )[0]
+                for q_chunk, k_chunk, v_chunk in zip(*splits)
+            ]
+            # interface output is (B, l_i, H, D); concat along the L axis
+            attn_output = torch.cat(attn_outputs, dim=1)
         else:
-            # Flash Attention forward pass
-            attn_output = flash_attn_func(
+            attn_mask = None
+            if attention_mask is not None:
+                attn_mask = attention_mask
+                if attn_mask.dim() == 2:
+                    attn_mask = attn_mask.unsqueeze(0)
+                if attn_mask.shape[0] == 1 and batch_size > 1:
+                    attn_mask = attn_mask.expand(batch_size, -1, -1)
+                attn_mask = attn_mask.unsqueeze(1)  # (B, 1, L, L)
+            attn_output, _ = attention_interface(
+                self,
                 query_states,
                 key_states,
                 value_states,
-                dropout_p=self.dropout if self.training else 0.0,
-                softmax_scale=self.scale,
-                causal=False,
+                attention_mask=attn_mask,
+                scaling=self.scale,
+                dropout=dropout,
+                is_causal=False,
+                **kwargs,
             )
 
-        # Reshape to (B, L, embed_dim)
         attn_output = attn_output.reshape(batch_size, q_len, self.embed_dim)
-
-        # No extra casting here.
-        # attn_output = self.out_proj(attn_output)
         attn_output = self.proj(attn_output)
 
         return attn_output, None
@@ -689,7 +522,7 @@ class OneVisionEncoderEncoderLayer(nn.Module):
     def __init__(self, config: LlavaOnevision2VisionConfig):
         super().__init__()
         self.embed_dim = config.hidden_size
-        self.self_attn = OneVisionEncoderFlashAttention2(config)
+        self.self_attn = OneVisionEncoderAttention(config)
         self.layer_norm1 = get_norm_layer(config)
         self.mlp = SiglipMLP(config)
         self.layer_norm2 = get_norm_layer(config)
@@ -788,72 +621,33 @@ class OneVisionEncoderEncoder(nn.Module):
             attentions=all_self_attentions,
         )
 
-    def forward_debug(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        rotary_pos_emb: Optional[torch.Tensor] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        max_seqlen: Optional[int] = None,
-    ) -> dict:
-        """
-        Forward pass with layer-by-layer debug outputs for consistency checking.
-
-        Returns:
-            dict: Contains:
-                - 'input_hidden_states': Input to the encoder
-                - 'input_rotary_pos_emb': Rotary position embeddings input
-                - 'layer_outputs': Dict mapping layer index to output after that layer
-                - 'final_output': Final encoder output
-        """
-        output = {}
-
-        # Save input
-        output["input_hidden_states"] = hidden_states.clone()
-        if rotary_pos_emb is not None:
-            output["input_rotary_pos_emb"] = rotary_pos_emb.clone()
-
-        # Layer-by-layer outputs
-        layer_outputs = {}
-
-        for layer_idx, layer in enumerate(self.layers):
-            # Save input to this layer
-            layer_outputs[f"layer_{layer_idx}_input"] = hidden_states.clone()
-
-            # Forward through layer
-            layer_result = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                rotary_pos_emb=rotary_pos_emb,
-                output_attentions=False,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-            )
-            hidden_states = layer_result[0]
-
-            # Save output of this layer
-            layer_outputs[f"layer_{layer_idx}_output"] = hidden_states.clone()
-
-        output["layer_outputs"] = layer_outputs
-        output["final_output"] = hidden_states.clone()
-
-        return output
-
 
 class LlavaOnevision2PreTrainedModel(PreTrainedModel):
     config_class = LlavaOnevision2MoeConfig
     base_model_prefix = "model"
+    input_modalities = ("image", "video", "text")
     supports_gradient_checkpointing = True
-    _supports_flash_attn_2 = True
-    _no_split_modules = ["OneVisionEncoderEncoderLayer"]
+    _no_split_modules = ["OneVisionEncoderEncoderLayer", "Qwen3DecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn = True
     _supports_sdpa = True
 
     def _init_weights(self, module):
         super()._init_weights(module)
-        # Custom weight initialization can be added here if needed
-        # For LlavaOnevision2VisionPretrainedModel, we rely on default initialization
+        # Re-initialize VisionRotaryEmbedding inv_freq buffers.
+        # These are registered with persistent=False, so they are not in the checkpoint
+        # state_dict. When ``from_pretrained`` materializes the model from meta tensors,
+        # the values in these buffers end up uninitialized. Mirror Qwen3-VL by explicitly
+        # filling them here so RoPE produces the correct frequencies post-load.
+        if isinstance(module, VisionRotaryEmbedding):
+            base = module.base
+            with torch.no_grad():
+                inv_t = 1.0 / (base ** (torch.arange(module.t_size, dtype=torch.float32) / module.t_size))
+                inv_h = 1.0 / (base ** (torch.arange(module.h_size, dtype=torch.float32) / module.h_size))
+                inv_w = 1.0 / (base ** (torch.arange(module.w_size, dtype=torch.float32) / module.w_size))
+                module.inv_freq_t.copy_(inv_t.to(module.inv_freq_t.device))
+                module.inv_freq_h.copy_(inv_h.to(module.inv_freq_h.device))
+                module.inv_freq_w.copy_(inv_w.to(module.inv_freq_w.device))
 
 
 class Siglip2MultiheadAttentionPoolingHead(nn.Module):
@@ -1096,27 +890,9 @@ class LlavaOnevision2VisionPretrainedModel(LlavaOnevision2PreTrainedModel):
         batch_size, total_patches, _ = hidden_states.shape
 
         # 2. RoPE Construction
-        # Get dimensions from grid_thw for block layout conversion
-        if grid_thw is not None:
-            t_frames = grid_thw[0, 0].item()
-            height = grid_thw[0, 1].item()
-            width = grid_thw[0, 2].item()
-        else:
-            # Fallback: infer from total_patches (assume single frame, square)
-            t_frames = 1
-            height = int(total_patches**0.5)
-            width = height
-
         if patch_positions is not None and patch_positions.dim() == 3:
             patch_positions = patch_positions.squeeze(0)
         freqs_visible = self.video_rope.forward_from_positions(patch_positions)
-
-        # Convert RoPE from row-major to block layout (matching Qwen2VL processor output)
-        # Use position-based grouping for videos with variable frame sizes
-        # Pass grid_thw for reliable h, w extraction (especially for non-square images)
-        freqs_visible = convert_rope_to_block_layout_by_positions(
-            freqs_visible, patch_positions, spatial_merge_size=self.spatial_merge_size, grid_thw=grid_thw
-        )
 
         # Concatenate D/2 + D/2 -> D for applying rope
         freqs_visible = torch.cat([freqs_visible, freqs_visible], dim=-1)
@@ -1184,128 +960,20 @@ class LlavaOnevision2VisionPretrainedModel(LlavaOnevision2PreTrainedModel):
             attentions=encoder_outputs.attentions if output_attentions else None,
         )
 
-    def forward_debug(
-        self,
-        hidden_state: torch.Tensor,
-        grid_thw: torch.Tensor,
-        patch_positions: Optional[torch.Tensor] = None,
-    ) -> dict:
-        """
-        Debug version of forward pass that captures intermediate states.
-
-        Identical to forward() but saves intermediate outputs at key stages
-        for debugging and consistency checking purposes.
-
-        Args:
-            hidden_state: Pre-processed patches from Qwen2VL processor.
-                Shape: [total_patches, num_channels, patch_size, patch_size]
-            grid_thw: Grid sizes tensor of shape [num_samples, 3] with [t, h, w] for each sample.
-                Required for computing RoPE and handling visible indices.
-            patch_positions: Optional explicit patch positions for RoPE computation.
-
-        Returns:
-            dict: Dictionary containing intermediate outputs:
-                - "input_pixel_values": Input to the model
-                - "after_patch_embed": Embeddings after patch projection
-                - "rotary_pos_emb": Rotary position embeddings
-                - "after_pre_layernorm": Embeddings after pre-normalization
-                - "layer_outputs": Dict mapping layer index to input/output
-                - "before_adapter": Final output before merger (same as after_decoder)
-                - "after_merger": Output after patch merger
-        """
-        output = {}
-
-        # Store input for consistency checking
-        output["input_pixel_values"] = hidden_state.clone()
-        output["input_grid_thw"] = grid_thw.clone()
-
-        # 1. Embeddings
-        # Note: embeddings returns [total_patches, embed_dim], we need to add batch dimension
-        hidden_states = self.embeddings(hidden_state)
-        if hidden_states.dim() == 2:
-            hidden_states = hidden_states.unsqueeze(0)  # [1, total_patches, embed_dim]
-        output["after_patch_embed"] = hidden_states.clone()
-
-        batch_size, total_patches, _ = hidden_states.shape
-
-        # 2. RoPE Construction
-        # Get dimensions from grid_thw for block layout conversion
-        if grid_thw is not None:
-            t_frames = grid_thw[0, 0].item()
-            height = grid_thw[0, 1].item()
-            width = grid_thw[0, 2].item()
-
-        if patch_positions is not None and patch_positions.dim() == 3:
-            patch_positions = patch_positions.squeeze(0)
-
-        freqs_visible = self.video_rope.forward_from_positions(patch_positions)
-
-        # Convert RoPE from row-major to block layout (matching Qwen2VL processor output)
-        # Use position-based grouping for videos with variable frame sizes
-        # Pass grid_thw for reliable h, w extraction (especially for non-square images)
-        freqs_visible = convert_rope_to_block_layout_by_positions(
-            freqs_visible, patch_positions, spatial_merge_size=self.spatial_merge_size, grid_thw=grid_thw
-        )
-
-        # Concatenate D/2 + D/2 -> D for applying rope
-        freqs_visible = torch.cat([freqs_visible, freqs_visible], dim=-1)
-        if freqs_visible.dim() == 2:
-            freqs_visible = freqs_visible.unsqueeze(0)
-
-        output["rotary_pos_emb"] = freqs_visible.clone()
-
-        # 3. Pre-Norm & Encoder
-        hidden_states = self.layernorm_pre(hidden_states)
-        output["after_pre_layernorm"] = hidden_states.clone()
-
-        cu_seqlens, max_seqlen = self._build_cu_seqlens(
-            grid_thw=grid_thw,
-            total_patches=total_patches,
-            fixed_t=getattr(self.config, "frame_windows_size", 4),
-            device=hidden_states.device,
-        )
-
-        encoder_debug_output = self.encoder.forward_debug(
-            hidden_states,
-            attention_mask=None,
-            rotary_pos_emb=freqs_visible,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-        )
-
-        # Extract layer outputs
-        output["layer_outputs"] = encoder_debug_output.get("layer_outputs", {})
-
-        # Use last layer output
-        num_layers = len(self.encoder.layers)
-        sequence_output = output["layer_outputs"][f"layer_{num_layers - 1}_output"]
-
-        # Post-Norm
-        if self.layernorm_post is not None:
-            sequence_output = self.layernorm_post(sequence_output)
-
-        output["before_adapter"] = sequence_output.clone()
-
-        # Patch merger
-        merged_output = self.merger(sequence_output, patch_positions=patch_positions)
-        output["after_merger"] = merged_output.clone()
-
-        return output
-
 
 @auto_docstring
 class LlavaOnevision2Model(LlavaOnevision2PreTrainedModel):
     base_model_prefix = ""
-    _checkpoint_conversion_mapping = {"^model": "language_model"}
     # Reference: fix gemma3 grad acc #37208
     accepts_loss_kwargs = False
     config: LlavaOnevision2MoeConfig
-    _no_split_modules = ["OneVisionEncoderEncoderLayer"]
+    _no_split_modules = ["OneVisionEncoderEncoderLayer", "Qwen3DecoderLayer"]
 
     def __init__(self, config: LlavaOnevision2MoeConfig):
         super().__init__(config)
         self.visual = LlavaOnevision2VisionPretrainedModel._from_config(config.vision_config)
         self.language_model = AutoModel.from_config(config.text_config)
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1478,15 +1146,28 @@ class LlavaOnevision2Model(LlavaOnevision2PreTrainedModel):
             The temporal, height and width of feature shape of each image in LLM.
         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
             The temporal, height and width of feature shape of each video in LLM.
+        patch_positions (`torch.LongTensor` of shape `(total_patches, 3)` or `(1, total_patches, 3)`, *optional*):
+            Explicit per-patch `(t, h, w)` position indices used by the vision tower to compute 3D rotary
+            position embeddings (and the optional absolute position embedding inside the patch merger).
+            `total_patches` is the sum of `t * h * w` across all images and videos in the batch, matching
+            the layout produced by the Qwen2VL-style image processor.
         second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
             The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+              Indices depicting the position of the input sequence tokens in the sequence. Contrarily to
+              `position_ids`, this tensor is not affected by padding.
+
+        Note: see the top-level ``LlavaOnevision2ForConditionalGeneration.forward``
+        docstring; in P0 video flows in via the ``image_grid_thw`` / ``pixel_values``
+        alias, so ``pixel_values_videos`` / ``video_grid_thw`` /
+        ``second_per_grid_ts`` are unused at this layer.
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_router_logits = (
-            output_router_logits if output_router_logits is not None else self.config.output_router_logits
-        )
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        output_router_logits = (
+            output_router_logits if output_router_logits is not None else self.config.output_router_logits
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1506,7 +1187,9 @@ class LlavaOnevision2Model(LlavaOnevision2PreTrainedModel):
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         if pixel_values_videos is not None:
-            video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
+            video_embeds = self.get_video_features(
+                pixel_values_videos, video_grid_thw, patch_positions=patch_positions
+            )
             video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
             _, video_mask = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
@@ -1559,7 +1242,7 @@ class LlavaOnevision2Model(LlavaOnevision2PreTrainedModel):
 
 
 def load_balancing_loss_func(
-    gate_logits: Union[torch.Tensor, Tuple[torch.Tensor], None],
+    gate_logits: Union[torch.Tensor, tuple[torch.Tensor], None],
     num_experts: Optional[int] = None,
     top_k: int = 2,
     attention_mask: Optional[torch.Tensor] = None,
@@ -1640,10 +1323,6 @@ def load_balancing_loss_func(
 
 @auto_docstring
 class LlavaOnevision2ForConditionalGeneration(LlavaOnevision2PreTrainedModel, GenerationMixin):
-    _checkpoint_conversion_mapping = {
-        "^visual": "model.visual",
-        r"^model(?!\.(language_model|visual))": "model.language_model",
-    }
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
     # Reference: fix gemma3 grad acc #37208
     accepts_loss_kwargs = False
@@ -1673,9 +1352,12 @@ class LlavaOnevision2ForConditionalGeneration(LlavaOnevision2PreTrainedModel, Ge
         return self.model.get_decoder()
 
     def get_video_features(
-        self, pixel_values_videos: torch.FloatTensor, video_grid_thw: Optional[torch.LongTensor] = None
+        self,
+        pixel_values_videos: torch.FloatTensor,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        patch_positions=None,
     ):
-        return self.model.get_video_features(pixel_values_videos, video_grid_thw)
+        return self.model.get_video_features(pixel_values_videos, video_grid_thw, patch_positions=patch_positions)
 
     def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None):
         return self.model.get_image_features(pixel_values, image_grid_thw)
@@ -1722,8 +1404,29 @@ class LlavaOnevision2ForConditionalGeneration(LlavaOnevision2PreTrainedModel, Ge
             The temporal, height and width of feature shape of each image in LLM.
         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
             The temporal, height and width of feature shape of each video in LLM.
+        patch_positions (`torch.LongTensor` of shape `(total_patches, 3)` or `(1, total_patches, 3)`, *optional*):
+            Explicit per-patch `(t, h, w)` position indices used by the vision tower to compute 3D rotary
+            position embeddings (and the optional absolute position embedding inside the patch merger).
+            `total_patches` is the sum of `t * h * w` across all images and videos in the batch, matching
+            the layout produced by the Qwen2VL-style image processor.
         second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
             The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+              Indices depicting the position of the input sequence tokens in the sequence. Contrarily to
+              `position_ids`, this tensor is not affected by padding.
+
+        Note (P0 native-video alias):
+            The companion ``Llava_Onevision2Processor.__call__(videos=...)`` does NOT
+            pass ``pixel_values_videos`` / ``video_grid_thw`` / ``second_per_grid_ts``
+            to this forward. Instead it aliases the video patch tensor as
+            ``pixel_values=`` and ``image_grid_thw=``, so video inputs share the
+            same code path as multi-image inputs (the OneVision encoder is purely
+            spatial; temporal information is carried by per-frame ``<X.X seconds>``
+            text tags emitted by the processor). The ``*_videos`` and
+            ``second_per_grid_ts`` kwargs are kept declared here only for API
+            completeness and future use (e.g. 3D mRoPE / ``get_rope_index``); they
+            are NOT consumed by the current OneVision encoder. See
+            NATIVE_VIDEO_PLAN.md (stage 3.1) for the full rationale.
 
         Example:
 
@@ -1831,6 +1534,7 @@ class LlavaOnevision2ForConditionalGeneration(LlavaOnevision2PreTrainedModel, Ge
         patch_positions=None,
         video_grid_thw=None,
         second_per_grid_ts=None,
+        is_first_iteration=False,
         **kwargs,
     ):
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
@@ -1848,10 +1552,17 @@ class LlavaOnevision2ForConditionalGeneration(LlavaOnevision2PreTrainedModel, Ge
             second_per_grid_ts=second_per_grid_ts,
             patch_positions=patch_positions,
             use_cache=use_cache,
+            is_first_iteration=is_first_iteration,
             **kwargs,
         )
 
-        if cache_position[0] != 0:
+        # After the prefill iteration, drop image inputs so the vision tower
+        # isn't re-run on decode steps. Gating on `is_first_iteration` (the
+        # Qwen3-VL convention) is the only reliable signal in transformers
+        # 5.x: `past_key_values` is non-None even on the first call (an empty
+        # DynamicCache is created up-front by `generate`), and `cache_position`
+        # may be `None` for remote-code models.
+        if not is_first_iteration and use_cache:
             model_inputs["pixel_values"] = None
             model_inputs["pixel_values_videos"] = None
 
@@ -1923,7 +1634,14 @@ class LlavaOnevision2ForConditionalGeneration(LlavaOnevision2PreTrainedModel, Ge
         if expand_size == 1:
             return input_ids, model_kwargs
 
-        visual_keys = ["pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw", "second_per_grid_ts"]
+        visual_keys = [
+            "pixel_values",
+            "image_grid_thw",
+            "pixel_values_videos",
+            "video_grid_thw",
+            "second_per_grid_ts",
+            "patch_positions",
+        ]
 
         def _expand_dict_for_generation_visual(dict_to_expand):
             image_grid_thw = model_kwargs.get("image_grid_thw", None)
@@ -1968,6 +1686,18 @@ class LlavaOnevision2ForConditionalGeneration(LlavaOnevision2PreTrainedModel, Ge
                     dict_to_expand[key] = _repeat_interleave_samples(
                         dict_to_expand[key], lengths=list(video_nums), repeat_times=expand_size
                     )
+                elif key == "patch_positions":
+                    if image_grid_thw is not None and image_grid_thw.numel() > 0 and image_nums.sum() > 0:
+                        samples = torch.split(image_grid_thw, list(image_nums))
+                        lengths = [torch.prod(sample, dim=1).sum() for sample in samples]
+                    elif video_grid_thw is not None and video_grid_thw.numel() > 0 and video_nums.sum() > 0:
+                        samples = torch.split(video_grid_thw, list(video_nums))
+                        lengths = [torch.prod(sample, dim=1).sum() for sample in samples]
+                    else:
+                        continue
+                    dict_to_expand[key] = _repeat_interleave_samples(
+                        dict_to_expand[key], lengths=lengths, repeat_times=expand_size
+                    )
             return dict_to_expand
 
         def _expand_dict_for_generation(dict_to_expand):
@@ -2000,13 +1730,4 @@ __all__ = [
     "LlavaOnevision2ForConditionalGeneration",
     "LlavaOnevision2Model",
     "LlavaOnevision2PreTrainedModel",
-    "LlavaOnevision2VisionPretrainedModel",
-    # Vision components
-    "VisionRotaryEmbedding",
-    "OneVisionEncoderEmbeddings",
-    "OneVisionEncoderFlashAttention2",
-    "OneVisionEncoderEncoderLayer",
-    "OneVisionEncoderEncoder",
-    "LlavaOnevision2VisionPatchMerger",
-    "Siglip2MultiheadAttentionPoolingHead",
 ]
