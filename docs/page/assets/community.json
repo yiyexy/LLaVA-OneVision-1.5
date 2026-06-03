@@ -1,7 +1,7 @@
 {
   "owner": "EvolvingLMMs-Lab",
   "repo": "LLaVA-OneVision-2",
-  "generated_at": "2026-06-02T04:04:34.619703+00:00",
+  "generated_at": "2026-06-03T04:14:24.196032+00:00",
   "contributors": [
     {
       "login": "anxiangsir",
@@ -5144,6 +5144,56 @@
       "login": "jbotwell",
       "starred_at": "2026-06-02T03:18:52Z",
       "avatar_url": "https://avatars.githubusercontent.com/u/129123448?v=4"
+    },
+    {
+      "login": "MOOD-128",
+      "starred_at": "2026-06-02T04:29:17Z",
+      "avatar_url": "https://avatars.githubusercontent.com/u/238191957?v=4"
+    },
+    {
+      "login": "hqhq1025",
+      "starred_at": "2026-06-02T07:35:18Z",
+      "avatar_url": "https://avatars.githubusercontent.com/u/78337154?v=4"
+    },
+    {
+      "login": "cyuQ1n",
+      "starred_at": "2026-06-02T12:20:27Z",
+      "avatar_url": "https://avatars.githubusercontent.com/u/147234300?v=4"
+    },
+    {
+      "login": "josiasmiller",
+      "starred_at": "2026-06-02T16:12:35Z",
+      "avatar_url": "https://avatars.githubusercontent.com/u/182281014?v=4"
+    },
+    {
+      "login": "Yejinzeng",
+      "starred_at": "2026-06-03T01:26:02Z",
+      "avatar_url": "https://avatars.githubusercontent.com/u/100839907?v=4"
+    },
+    {
+      "login": "jiajiachen",
+      "starred_at": "2026-06-03T01:52:49Z",
+      "avatar_url": "https://avatars.githubusercontent.com/u/6790765?v=4"
+    },
+    {
+      "login": "liu-fans",
+      "starred_at": "2026-06-03T02:49:38Z",
+      "avatar_url": "https://avatars.githubusercontent.com/u/65279329?v=4"
+    },
+    {
+      "login": "Fu-Fu-Fu-Fu",
+      "starred_at": "2026-06-03T02:54:03Z",
+      "avatar_url": "https://avatars.githubusercontent.com/u/133620232?v=4"
+    },
+    {
+      "login": "m2408gj",
+      "starred_at": "2026-06-03T03:13:19Z",
+      "avatar_url": "https://avatars.githubusercontent.com/u/26135508?v=4"
+    },
+    {
+      "login": "JunchengYan",
+      "starred_at": "2026-06-03T04:13:08Z",
+      "avatar_url": "https://avatars.githubusercontent.com/u/85991234?v=4"
     }
   ]
 }
